@@ -1,0 +1,166 @@
+image: ubuntu:22.04
+
+stages:
+  - sonarqube-check
+  - sonarqube-vulnerability-report
+  - deploy
+  - test
+  - tagging
+  - release
+  - notify
+
+sonarqube-check:
+  stage: sonarqube-check
+  image: 
+    name: sonarsource/sonar-scanner-cli:5.0
+    entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+    GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script: 
+    - sonar-scanner
+  allow_failure: true
+  only:
+    - main
+
+sonarqube-vulnerability-report:
+  stage: sonarqube-vulnerability-report
+  before_script:
+    - apt update -qy
+    - apt install -y curl
+  script:
+    - 'curl -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/issues/gitlab_sast_export?projectKey=stream-dev-ops&branch=${CI_COMMIT_BRANCH}&pullRequest=${CI_MERGE_REQUEST_IID}" -o gl-sast-sonar-report.json'
+  allow_failure: true
+  only:
+    - main
+  artifacts:
+    expire_in: 1 day
+    reports:
+      sast: gl-sast-sonar-report.json
+  dependencies:
+    - sonarqube-check
+
+deploy-site:
+  stage: deploy
+  environment:
+    name: $CI_COMMIT_BRANCH
+  before_script:
+    - apt update -qy
+    - apt install -y lftp
+  script:
+    - lftp -c "set ftp:ssl-allow no; open $FTP_SERVER; user $FTP_USERNAME $FTP_PASSWORD; mirror --ignore-time --parallel=10 --exclude sonar-project.properties --exclude README.md --exclude .git/ --exclude .gitignore --exclude .gitlab-ci.yml --reverse --verbose ./ ./$FTP_FOLDER; bye"
+  only:
+    - dev
+    - stg
+    - prod
+
+testing:
+  stage: test
+  environment:
+    name: $CI_COMMIT_BRANCH
+  before_script:
+    - apt update -qy
+    - apt install -y curl
+  script:
+    - |
+      URL_TO_TEST="${CI_ENVIRONMENT_URL}send.php"
+      TEST_RESULT=$(curl --location $URL_TO_TEST -H 'content-type: application/x-www-form-urlencoded' -H 'cookie: humans_21909=1' --data-urlencode 'InputEmail=usuario@gmail.com' --data-urlencode 'InputPassword=Hola-mundo-123!')
+      if [ "$TEST_RESULT" == "OK SUCCESS LOGIN" ]; then
+        echo "Test passed"
+      else
+        echo "URL_TO_TEST=$URL_TO_TEST"
+        echo "TEST_RESULT=$TEST_RESULT"
+        echo "Test failed"
+        exit 1
+      fi
+  dependencies:
+    - deploy-site
+  only:
+    - dev
+    - stg
+    - prod
+
+tagging:
+  stage: tagging
+  before_script:
+    - apt update -qy
+    - apt install -y git 
+  script:
+    - |
+      git config --global user.email "$CI_USER_EMAIL"
+      git config --global user.name "$CI_USER_NAME"
+
+      CI_USER_NAME=$(echo $CI_USER_EMAIL | awk -F@ '{print $1}')
+      
+      # Obtener el último tag
+      LAST_TAG=$(git describe --abbrev=0 --tags)
+      
+      # Extraer la última parte del tag (el último número)
+      LAST_VERSION_NUMBER=$(echo "$LAST_TAG" | awk -F. '{print $3}')
+      
+      # Incrementar el último número de versión
+      NEW_VERSION_NUMBER=$((LAST_VERSION_NUMBER + 1))
+      
+      # Construir el nuevo tag
+      NEW_TAG="v$(date +'%y.%m').$NEW_VERSION_NUMBER"
+      
+      # Crear el nuevo tag
+      git tag -a "$NEW_TAG" -m "Release $NEW_TAG"
+      
+      # Subir el nuevo tag al repositorio
+      git push --tags https://$CI_USER_NAME:$ACCESS_TOKEN@$CI_SERVER_HOST/$CI_PROJECT_PATH.git HEAD:$CI_COMMIT_BRANCH
+  only:
+    - prod
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: $CI_COMMIT_TAG                 # Run this job when a tag is created
+  script:
+    - echo "running release job"
+  release:                               # See https://docs.gitlab.com/ee/ci/yaml/#release for available properties
+    tag_name: '$CI_COMMIT_TAG'
+    name: 'Release $CI_COMMIT_TAG'
+    description: 'Relase $CI_COMMIT_TAG'
+
+notify:
+  stage: notify
+  allow_failure: true
+  before_script:
+    - apt update -qy
+    - apt install -y curl git
+  script:
+    - SLACK_MESSAGE="${PROJECT_NAME} CI/CD Pipeline Deployment Jobs for Env [$CI_COMMIT_REF_NAME]\n⚙ $CI_COMMIT_TITLE 🎯\n\nDESCRIPCION $CI_COMMIT_DESCRIPTION\n\nCOMMIT $CI_COMMIT_SHORT_SHA\n\nAUTOR $CI_COMMIT_AUTHOR <!channel>"
+    - | 
+      if [ "$CI_COMMIT_REF_NAME" == "prod" ]; then
+        VERSION_TAG=$(git describe --abbrev=0 --tags)
+        SLACK_MESSAGE="${SLACK_MESSAGE}\n\n RELEASE $VERSION_TAG"
+      fi
+      (curl -X POST https://slack.com/api/chat.postMessage -H "Authorization: Bearer ${SLACK_TOKEN}" -H 'Content-Type:application/json;charset=utf-8' -d "{\"channel\": \"${SLACK_CHANNEL}\",\"text\": \"${SLACK_MESSAGE}\"}")
+  dependencies:
+    - testing
+  only:
+    - dev
+    - stg
+    - prod
+
+notify-failure:
+  stage: notify
+  when: on_failure
+  allow_failure: true
+  before_script:
+    - apt update -qy
+    - apt install -y curl
+  script:
+    - SLACK_MESSAGE="${PROJECT_NAME} CI/CD Pipeline Deployment Jobs for Env [$CI_COMMIT_REF_NAME]\n ⚙ Job failed!!!! \n\nCOMMIT $CI_COMMIT_SHORT_SHA\n\nPIPELINE URL $CI_PIPELINE_URL <!channel>"
+    - | 
+      (curl -X POST https://slack.com/api/chat.postMessage -H "Authorization: Bearer ${SLACK_TOKEN}" -H 'Content-Type:application/json;charset=utf-8' -d "{\"channel\": \"${SLACK_CHANNEL}\",\"text\": \"${SLACK_MESSAGE}\"}")
+  only:
+    - dev
+    - stg
+    - prod
